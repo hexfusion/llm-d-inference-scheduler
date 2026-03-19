@@ -158,6 +158,18 @@ The setup can be split in two:
 This enables cluster sharing by multiple developers. In case of private/personal
 clusters, the `default` namespace can be used directly.
 
+### RBAC and Permissions
+
+EPP is fully namespace-scoped each namespace runs an independent instance with
+no cross-namespace RBAC. CRDs and the kgateway controller are cluster-scoped and
+installed once by a cluster-admin (see [Setup - Infrastructure](#setup---infrastructure)).
+EPP itself only requires a `Role` with `get/watch/list` on `inferencepools` and `pods`.
+
+> [!NOTE]
+> Ports 9090 (metrics) and 9002 (ext-proc) have no application-level auth. In the
+> reference deployment Istio mTLS restricts access. Without Istio, use NetworkPolicy
+> to limit these ports to your monitoring and gateway namespaces respectively.
+
 ### Setup - Infrastructure
 
 > [!CAUTION]

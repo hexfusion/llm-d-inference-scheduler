@@ -50,6 +50,16 @@ workloads currently.
 [Envoy]:https://github.com/envoyproxy/envoy
 [ext-proc]:https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/ext_proc_filter
 
+## Installation
+
+First, follow the [GIE getting started guide] to install the cluster-scoped
+prerequisites (Gateway API CRDs, GIE CRDs, and a compatible gateway controller).
+
+Then see [DEVELOPMENT.md](DEVELOPMENT.md) for deploying EPP into your namespace,
+configuration options, and RBAC details. A Helm chart is planned.
+
+[GIE getting started guide]:https://gateway-api-inference-extension.sigs.k8s.io/guides/
+
 ## Contributing
 
 Our community meeting is bi-weekly at Wednesday 10AM PDT ([Google Meet], [Meeting Notes]).
