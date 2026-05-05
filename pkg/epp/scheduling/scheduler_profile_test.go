@@ -23,11 +23,13 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/require"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 
 	fwkdl "github.com/llm-d/llm-d-inference-scheduler/pkg/epp/framework/interface/datalayer"
 	fwkplugin "github.com/llm-d/llm-d-inference-scheduler/pkg/epp/framework/interface/plugin"
 	fwksched "github.com/llm-d/llm-d-inference-scheduler/pkg/epp/framework/interface/scheduling"
+	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/scheduling/adaptive"
 )
 
 func TestSchedulePlugins(t *testing.T) {
@@ -613,4 +615,100 @@ func findEndpoints(endpoints []fwksched.Endpoint, names ...k8stypes.NamespacedNa
 		}
 	}
 	return res
+}
+
+// Adaptive routing wiring smoke tests. Per-scorer modulation and
+// PickerSelector logic are unit-tested in pkg/epp/scheduling/adaptive;
+// these only verify that toggling the SignalStore + burst picker via
+// the SchedulerProfile builders doesn't break Run().
+
+func runProfileForAdaptive(t *testing.T, store *adaptive.SignalStore) *fwksched.ProfileRunResult {
+	t.Helper()
+	tp := &testPlugin{ScoreRes: 0.5, FilterRes: []k8stypes.NamespacedName{{Name: "pod1"}, {Name: "pod2"}}}
+	picker := &testPlugin{PickRes: k8stypes.NamespacedName{Name: "pod1"}}
+
+	profile := NewSchedulerProfile().
+		WithFilters(tp).
+		WithScorers(NewWeightedScorer(tp, 0.7)).
+		WithPicker(picker)
+	if store != nil {
+		profile.WithAdaptiveSignals(store)
+	}
+
+	endpoints := []fwksched.Endpoint{
+		fwksched.NewEndpoint(&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: "pod1"}}, nil, nil),
+		fwksched.NewEndpoint(&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: "pod2"}}, nil, nil),
+	}
+	req := &fwksched.InferenceRequest{RequestID: uuid.New().String()}
+
+	result, err := profile.Run(context.Background(), req, fwksched.NewCycleState(), endpoints)
+	require.NoError(t, err)
+	require.Len(t, result.TargetEndpoints, 1)
+	return result
+}
+
+func TestSchedulerProfile_AdaptiveSignalsWiring(t *testing.T) {
+	cases := []struct {
+		name    string
+		state   *adaptive.SignalState // nil → adaptive off
+		wantPod string
+	}{
+		{"adaptive off (no signal store)", nil, "pod1"},
+		{"adaptive on, zero state (rollout window)", &adaptive.SignalState{}, "pod1"},
+		{"adaptive on, live signals", &adaptive.SignalState{Imbalance: 0.7, Burst: 0.2}, "pod1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var store *adaptive.SignalStore
+			if tc.state != nil {
+				store = adaptive.NewSignalStore()
+				store.Store(*tc.state)
+			}
+			result := runProfileForAdaptive(t, store)
+			require.Equal(t, tc.wantPod, result.TargetEndpoints[0].GetMetadata().NamespacedName.Name)
+		})
+	}
+}
+
+func TestSchedulerProfile_BurstPickerSwap(t *testing.T) {
+	cases := []struct {
+		name                 string
+		burstActive          bool
+		configureBurstPicker bool
+		wantPod              string
+	}{
+		{"no burst picker, BurstActive=false → default", false, false, "pod1"},
+		{"no burst picker, BurstActive=true → still default (opt-in not wired)", true, false, "pod1"},
+		{"burst picker attached, BurstActive=false → default", false, true, "pod1"},
+		{"burst picker attached, BurstActive=true → burst", true, true, "pod2"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tp := &testPlugin{ScoreRes: 0.5, FilterRes: []k8stypes.NamespacedName{{Name: "pod1"}, {Name: "pod2"}}}
+			defaultPicker := &testPlugin{PickRes: k8stypes.NamespacedName{Name: "pod1"}}
+			burstPicker := &testPlugin{PickRes: k8stypes.NamespacedName{Name: "pod2"}}
+
+			store := adaptive.NewSignalStore()
+			store.Store(adaptive.SignalState{BurstActive: tc.burstActive})
+
+			profile := NewSchedulerProfile().
+				WithFilters(tp).
+				WithScorers(NewWeightedScorer(tp, 0.7)).
+				WithPicker(defaultPicker).
+				WithAdaptiveSignals(store)
+			if tc.configureBurstPicker {
+				profile.WithBurstPicker(burstPicker)
+			}
+
+			endpoints := []fwksched.Endpoint{
+				fwksched.NewEndpoint(&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: "pod1"}}, nil, nil),
+				fwksched.NewEndpoint(&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: "pod2"}}, nil, nil),
+			}
+			req := &fwksched.InferenceRequest{RequestID: uuid.New().String()}
+
+			result, err := profile.Run(context.Background(), req, fwksched.NewCycleState(), endpoints)
+			require.NoError(t, err)
+			require.Equal(t, tc.wantPod, result.TargetEndpoints[0].GetMetadata().NamespacedName.Name)
+		})
+	}
 }

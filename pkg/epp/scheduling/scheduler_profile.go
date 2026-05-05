@@ -29,6 +29,7 @@ import (
 	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/framework/interface/plugin"
 	fwksched "github.com/llm-d/llm-d-inference-scheduler/pkg/epp/framework/interface/scheduling"
 	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/metrics"
+	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/scheduling/adaptive"
 )
 
 // NewSchedulerProfile creates a new SchedulerProfile object and returns its pointer.
@@ -45,6 +46,21 @@ type SchedulerProfile struct {
 	filters []fwksched.Filter
 	scorers []*WeightedScorer
 	picker  fwksched.Picker
+
+	// adaptiveSignals is set when the AdaptiveRouting feature gate is
+	// enabled. When nil, the scoring loop reads the declared scorer
+	// weight unchanged, matching pre-adaptive behavior. When set, the
+	// loop reads the current SignalState and modulates each weight
+	// via adaptive.EffectiveWeight.
+	adaptiveSignals *adaptive.SignalStore
+
+	// burstPicker is an optional picker swapped in when the current
+	// SignalState's BurstActive flag is true. When nil (the default),
+	// the profile uses the declared picker for every request; the
+	// adaptive subsystem then only modulates scorer weights, not
+	// picker selection. Operators opt in by attaching a burst picker
+	// via WithBurstPicker.
+	burstPicker fwksched.Picker
 }
 
 // WithFilters sets the given filter plugins as the Filter plugins.
@@ -65,6 +81,25 @@ func (p *SchedulerProfile) WithScorers(scorers ...*WeightedScorer) *SchedulerPro
 // if the SchedulerProfile has Picker plugin, this call replaces the existing plugin with the given one.
 func (p *SchedulerProfile) WithPicker(picker fwksched.Picker) *SchedulerProfile {
 	p.picker = picker
+	return p
+}
+
+// WithAdaptiveSignals attaches an adaptive.SignalStore to this profile.
+// When set, the scoring loop reads the current SignalState on every
+// request and modulates each scorer's declared weight via
+// adaptive.EffectiveWeight.
+func (p *SchedulerProfile) WithAdaptiveSignals(store *adaptive.SignalStore) *SchedulerProfile {
+	p.adaptiveSignals = store
+	return p
+}
+
+// WithBurstPicker attaches an optional burst-time picker. When the
+// adaptive SignalState's BurstActive is true, the profile picks an
+// endpoint via the burst picker instead of the declared default;
+// otherwise it uses the default. Has no effect unless
+// WithAdaptiveSignals is also set.
+func (p *SchedulerProfile) WithBurstPicker(picker fwksched.Picker) *SchedulerProfile {
+	p.burstPicker = picker
 	return p
 }
 
@@ -119,10 +154,16 @@ func (p *SchedulerProfile) Run(ctx context.Context, request *fwksched.InferenceR
 	if len(endpoints) == 0 {
 		return nil, errcommmon.Error{Code: errcommmon.Internal, Msg: "no endpoints available for the given request"}
 	}
-	// if we got here, there is at least one endpoint to score
-	weightedScorePerEndpoint := p.runScorerPlugins(ctx, request, cycleState, endpoints)
 
-	result := p.runPickerPlugin(ctx, cycleState, weightedScorePerEndpoint)
+	// Snapshot the adaptive SignalState ONCE per request so scoring
+	// and picker selection see consistent signals.
+	var sigs adaptive.SignalState
+	if p.adaptiveSignals != nil {
+		sigs = p.adaptiveSignals.Load()
+	}
+
+	weightedScorePerEndpoint := p.runScorerPlugins(ctx, request, cycleState, endpoints, sigs)
+	result := p.runPickerPlugin(ctx, cycleState, weightedScorePerEndpoint, sigs)
 
 	return result, nil
 }
@@ -148,7 +189,7 @@ func (p *SchedulerProfile) runFilterPlugins(ctx context.Context, request *fwksch
 	return filteredEndpoints
 }
 
-func (p *SchedulerProfile) runScorerPlugins(ctx context.Context, request *fwksched.InferenceRequest, cycleState *fwksched.CycleState, endpoints []fwksched.Endpoint) map[fwksched.Endpoint]float64 {
+func (p *SchedulerProfile) runScorerPlugins(ctx context.Context, request *fwksched.InferenceRequest, cycleState *fwksched.CycleState, endpoints []fwksched.Endpoint, sigs adaptive.SignalState) map[fwksched.Endpoint]float64 {
 	logger := log.FromContext(ctx)
 	logger.V(logutil.DEBUG).Info("Before running scorer plugins", "endpoints", endpoints)
 
@@ -156,15 +197,26 @@ func (p *SchedulerProfile) runScorerPlugins(ctx context.Context, request *fwksch
 	for _, endpoint := range endpoints {
 		weightedScorePerEndpoint[endpoint] = float64(0) // initialize weighted score per endpoint with 0 value
 	}
+	// When adaptive routing is disabled (p.adaptiveSignals == nil)
+	// every scorer's weight is its declared weight; when enabled the
+	// SignalState modulates per adaptive.EffectiveWeight. The
+	// SignalState was loaded once in Run() and passed in.
+	adaptiveOn := p.adaptiveSignals != nil
+
 	// Iterate through each scorer in the chain and accumulate the weighted scores.
 	for _, scorer := range p.scorers {
 		logger.V(logutil.VERBOSE).Info("Running scorer plugin", "plugin", scorer.TypedName())
 		before := time.Now()
 		scores := scorer.Score(ctx, cycleState, request, endpoints)
 		metrics.RecordPluginProcessingLatency(scorerExtensionPoint, scorer.TypedName().Type, scorer.TypedName().Name, time.Since(before))
+		weight := scorer.Weight()
+		if adaptiveOn {
+			weight = adaptive.EffectiveWeight(scorer, sigs)
+			adaptive.RecordWeight(scorer.TypedName().Name, string(scorer.Category()), weight)
+		}
 		for endpoint, score := range scores { // weight is relative to the sum of weights
 			logger.V(logutil.DEBUG).Info("Calculated score", "plugin", scorer.TypedName(), "endpoint", endpoint.GetMetadata().NamespacedName, "score", score)
-			weightedScorePerEndpoint[endpoint] += enforceScoreRange(score) * scorer.Weight()
+			weightedScorePerEndpoint[endpoint] += enforceScoreRange(score) * weight
 		}
 		logger.V(logutil.DEBUG).Info("Completed running scorer plugin successfully", "plugin", scorer.TypedName())
 	}
@@ -173,7 +225,7 @@ func (p *SchedulerProfile) runScorerPlugins(ctx context.Context, request *fwksch
 	return weightedScorePerEndpoint
 }
 
-func (p *SchedulerProfile) runPickerPlugin(ctx context.Context, cycleState *fwksched.CycleState, weightedScorePerEndpoint map[fwksched.Endpoint]float64) *fwksched.ProfileRunResult {
+func (p *SchedulerProfile) runPickerPlugin(ctx context.Context, cycleState *fwksched.CycleState, weightedScorePerEndpoint map[fwksched.Endpoint]float64, sigs adaptive.SignalState) *fwksched.ProfileRunResult {
 	logger := log.FromContext(ctx)
 	scoredEndpoints := make([]*fwksched.ScoredEndpoint, len(weightedScorePerEndpoint))
 	i := 0
@@ -181,12 +233,28 @@ func (p *SchedulerProfile) runPickerPlugin(ctx context.Context, cycleState *fwks
 		scoredEndpoints[i] = &fwksched.ScoredEndpoint{Endpoint: endpoint, Score: score}
 		i++
 	}
-	logger.V(logutil.VERBOSE).Info("Running picker plugin", "plugin", p.picker.TypedName())
+
+	// Pick the active picker. When adaptive routing is disabled, or
+	// no burst picker is configured, this is always the declared
+	// picker. Otherwise PickerSelector returns the burst picker iff
+	// the snapshot's BurstActive is true. RecordPickerActive is
+	// emitted every request so the metric reflects current routing
+	// state, not just transitions.
+	picker := p.picker
+	if p.adaptiveSignals != nil && p.burstPicker != nil {
+		sel := adaptive.PickerSelector{Default: p.picker, Burst: p.burstPicker}
+		picker = sel.SelectPicker(sigs)
+		burstActive := picker.TypedName().Name == p.burstPicker.TypedName().Name
+		adaptive.RecordPickerActive(p.burstPicker.TypedName().Name, burstActive)
+		adaptive.RecordPickerActive(p.picker.TypedName().Name, !burstActive)
+	}
+
+	logger.V(logutil.VERBOSE).Info("Running picker plugin", "plugin", picker.TypedName())
 	logger.V(logutil.DEBUG).Info("Candidate pods for picking", "endpoints-weighted-score", scoredEndpoints)
 	before := time.Now()
-	result := p.picker.Pick(ctx, cycleState, scoredEndpoints)
-	metrics.RecordPluginProcessingLatency(pickerExtensionPoint, p.picker.TypedName().Type, p.picker.TypedName().Name, time.Since(before))
-	logger.V(logutil.DEBUG).Info("Completed running picker plugin successfully", "plugin", p.picker.TypedName(), "result", result)
+	result := picker.Pick(ctx, cycleState, scoredEndpoints)
+	metrics.RecordPluginProcessingLatency(pickerExtensionPoint, picker.TypedName().Type, picker.TypedName().Name, time.Since(before))
+	logger.V(logutil.DEBUG).Info("Completed running picker plugin successfully", "plugin", picker.TypedName(), "result", result)
 
 	return result
 }

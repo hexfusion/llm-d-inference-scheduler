@@ -38,6 +38,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
@@ -52,6 +53,7 @@ import (
 	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/config/loader"
 	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/datalayer"
 	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/datastore"
+	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/scheduling/adaptive"
 	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/flowcontrol"
 	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/flowcontrol/contracts"
 	fccontroller "github.com/llm-d/llm-d-inference-scheduler/pkg/epp/flowcontrol/controller"
@@ -333,6 +335,14 @@ func (r *Runner) setup(ctx context.Context, cfg *rest.Config, opts *runserver.Op
 
 	scheduler := scheduling.NewSchedulerWithConfig(r.schedulerConfig)
 
+	var arrivalCounter *adaptive.ArrivalCounter
+	if r.featureGates[adaptive.FeatureGate] {
+		setupLog.Info("AdaptiveRouting feature gate enabled; starting configurator")
+		store, counter := bootstrapAdaptive(ctx, ds, ctrlmetrics.Registry)
+		r.schedulerConfig.AttachAdaptiveSignals(store)
+		arrivalCounter = counter
+	}
+
 	// Data layer is enabled by default; use the 'enableLegacyMetrics' feature gate to fall back to legacy polling.
 	datalayerMetricsEnabled := !r.featureGates[datalayer.EnableLegacyMetricsFeatureGate]
 	if err := r.configureAndStartDatalayer(ctx, datalayerMetricsEnabled, eppConfig.DataConfig, mgr); err != nil {
@@ -373,6 +383,9 @@ func (r *Runner) setup(ctx context.Context, cfg *rest.Config, opts *runserver.Op
 	}
 
 	director := requestcontrol.NewDirectorWithConfig(ds, scheduler, admissionController, endpointCandidates, r.requestControlConfig)
+	if arrivalCounter != nil {
+		director.WithAdaptiveArrivalCounter(arrivalCounter)
+	}
 
 	serverRunner := &runserver.ExtProcServerRunner{
 		GrpcPort:                         opts.GRPCPort,
@@ -529,6 +542,7 @@ func (r *Runner) parseConfigurationPhaseOne(ctx context.Context, opts *runserver
 	loader.RegisterFeatureGate(datalayer.ExperimentalDatalayerFeatureGate)
 	loader.RegisterFeatureGate(datalayer.EnableLegacyMetricsFeatureGate)
 	loader.RegisterFeatureGate(flowcontrol.FeatureGate)
+	loader.RegisterFeatureGate(adaptive.FeatureGate)
 
 	r.registerInTreePlugins()
 

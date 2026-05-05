@@ -40,6 +40,7 @@ import (
 	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/datalayer"
 	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/datastore"
 	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/flowcontrol/contracts"
+	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/scheduling/adaptive"
 	fwkdl "github.com/llm-d/llm-d-inference-scheduler/pkg/epp/framework/interface/datalayer"
 	fwk "github.com/llm-d/llm-d-inference-scheduler/pkg/epp/framework/interface/requestcontrol"
 	fwkrh "github.com/llm-d/llm-d-inference-scheduler/pkg/epp/framework/interface/requesthandling"
@@ -123,10 +124,22 @@ type Director struct {
 	// and value types cannot be nil
 	defaultPriority int
 
+	// arrivalCounter, when set, is incremented on every HandleRequest
+	// entry. 
+	arrivalCounter *adaptive.ArrivalCounter
+
 	// responseBodyQueues maps request IDs to their async processing channels.
 	// Each request gets a dedicated channel and goroutine to ensure chunks are
 	// processed in order while not blocking the streaming response path.
 	responseBodyQueues sync.Map
+}
+
+// WithAdaptiveArrivalCounter sets the arrival counter the BurstDetector
+// reads. Pass nil (or omit the call) to keep the request-entry path
+// unchanged. Idempotent.
+func (d *Director) WithAdaptiveArrivalCounter(counter *adaptive.ArrivalCounter) *Director {
+	d.arrivalCounter = counter
+	return d
 }
 
 // getInferenceObjective fetches the inferenceObjective from the datastore otherwise creates a new one based on reqCtx.
@@ -152,6 +165,10 @@ func (d *Director) HandleRequest(ctx context.Context, reqCtx *handlers.RequestCo
 	tracer := otel.Tracer("llm-d-inference-scheduler")
 	ctx, span := tracer.Start(ctx, "gateway.request_orchestration", trace.WithSpanKind(trace.SpanKindServer))
 	defer span.End()
+
+	if d.arrivalCounter != nil {
+		d.arrivalCounter.Inc()
+	}
 
 	logger := log.FromContext(ctx)
 
