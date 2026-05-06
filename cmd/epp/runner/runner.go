@@ -338,9 +338,7 @@ func (r *Runner) setup(ctx context.Context, cfg *rest.Config, opts *runserver.Op
 	var arrivalCounter *adaptive.ArrivalCounter
 	if r.featureGates[adaptive.FeatureGate] {
 		setupLog.Info("AdaptiveRouting feature gate enabled; starting configurator")
-		store, counter := bootstrapAdaptive(ctx, ds, ctrlmetrics.Registry)
-		r.schedulerConfig.AttachAdaptiveSignals(store)
-		arrivalCounter = counter
+		arrivalCounter = bootstrapAdaptive(ctx, ds, ctrlmetrics.Registry, r.schedulerConfig)
 	}
 
 	// Data layer is enabled by default; use the 'enableLegacyMetrics' feature gate to fall back to legacy polling.

@@ -6,17 +6,17 @@ import (
 )
 
 const (
-	// configuratorFanInBuffer: depth of the fan-in channel detectors
-	// push to. Signals are state not events; coalescing is fine.
+	// Signals are state, not events; coalescing is fine.
 	configuratorFanInBuffer = 4
-
-	// configuratorBurstActiveTimeout: how long the configurator keeps
-	// BurstActive set without a fresh burst signal. Prevents stuck-
-	// active when the burst detector goes silent.
+	// Force BurstActive off after this idle gap to prevent stuck-active.
 	configuratorBurstActiveTimeout = 60 * time.Second
 )
 
-// Configurator is the single goroutine that owns the SignalStore. 
+// Publisher receives every state transition. Runs inline on the
+// configurator goroutine — must not block.
+type Publisher func(SignalState)
+
+// Configurator is the single goroutine that owns the SignalStore.
 type Configurator struct {
 	store       *SignalStore
 	detectors   []Detector
@@ -24,9 +24,10 @@ type Configurator struct {
 	state       SignalState
 	lastBurstAt time.Time
 	watchdog    *Watchdog
+	publishers  []Publisher
 }
 
-// NewConfigurator wires the supplied detectors to a fresh store. 
+// NewConfigurator wires the supplied detectors to the given store.
 func NewConfigurator(store *SignalStore, detectors ...Detector) *Configurator {
 	return &Configurator{
 		store:     store,
@@ -43,6 +44,12 @@ func (c *Configurator) WithWatchdog(w *Watchdog) *Configurator {
 	return c
 }
 
+// AddPublisher registers p; called on every state transition (and once at start).
+func (c *Configurator) AddPublisher(p Publisher) *Configurator {
+	c.publishers = append(c.publishers, p)
+	return c
+}
+
 func (c *Configurator) Run(ctx context.Context) error {
 	for _, det := range c.detectors {
 		d := det
@@ -52,7 +59,10 @@ func (c *Configurator) Run(ctx context.Context) error {
 	}
 
 	c.state.UpdatedAt = time.Now()
-	c.store.Store(c.state)
+	c.store.Put(c.state)
+	for _, p := range c.publishers {
+		p(c.state)
+	}
 
 	for {
 		select {
@@ -65,7 +75,7 @@ func (c *Configurator) Run(ctx context.Context) error {
 }
 
 // handleSignal merges one signal into the configurator state and
-// publishes the result. 
+// publishes the result.
 func (c *Configurator) handleSignal(sig Signal) {
 	prevBurstActive := c.state.BurstActive
 	switch sig.Name {
@@ -91,34 +101,28 @@ func (c *Configurator) handleSignal(sig Signal) {
 			from, to = "Adapting", "Idle"
 		}
 		RecordTransition("burst", from, to, "hysteresis")
-		// Feed the watchdog: a burst on/off flip is the transition
-		// it counts. If THIS transition trips the freeze, emit the
-		// flap-detected metric (only on the trip itself, not on
-		// further transitions while frozen).
+		// Emit flap metric only on the trip itself, not subsequent transitions.
 		if c.watchdog != nil && c.watchdog.RecordTransition() {
 			RecordFlapDetected()
 		}
 	}
 
-	// Stale-burst safety: if BurstActive was set but no burst signal
-	// has arrived in configuratorBurstActiveTimeout, force it off so
-	// a silent burst detector cannot leave the system stuck in burst
-	// mode forever.
+	// Stale-burst safety: silent detector must not leave us stuck active.
 	if c.state.BurstActive && !c.lastBurstAt.IsZero() &&
 		time.Since(c.lastBurstAt) > configuratorBurstActiveTimeout {
 		c.state.BurstActive = false
 	}
 
-	// Publish a copy of state. If the watchdog is frozen, force a
-	// neutral state so EffectiveWeight returns declared weights and
-	// the picker selector returns the default picker — adaptive
-	// routing is effectively disabled until the freeze expires. 
-	publish := c.state
+	// Watchdog freeze forces neutral state — adaptive disabled until expiry.
+	state := c.state
 	if c.watchdog != nil && c.watchdog.IsFrozen() {
-		publish.Imbalance = 0
-		publish.Burst = 0
-		publish.BurstActive = false
+		state.Imbalance = 0
+		state.Burst = 0
+		state.BurstActive = false
 	}
-	publish.UpdatedAt = sig.Timestamp
-	c.store.Store(publish)
+	state.UpdatedAt = sig.Timestamp
+	c.store.Put(state)
+	for _, p := range c.publishers {
+		p(state)
+	}
 }

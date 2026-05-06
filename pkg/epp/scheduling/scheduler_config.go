@@ -20,7 +20,6 @@ import (
 	"fmt"
 
 	framework "github.com/llm-d/llm-d-inference-scheduler/pkg/epp/framework/interface/scheduling"
-	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/scheduling/adaptive"
 )
 
 // NewSchedulerConfig creates a new SchedulerConfig object and returns its pointer.
@@ -45,15 +44,10 @@ func (c *SchedulerConfig) String() string {
 	)
 }
 
-// AttachAdaptiveSignals wires the supplied SignalStore into every concrete
-// *SchedulerProfile in this config. With the store attached, the scoring loop
-// reads SignalState per request and modulates each scorer's weight via
-// adaptive.EffectiveWeight; without it the loop reads scorer.Weight()
-// unchanged.
-func (c *SchedulerConfig) AttachAdaptiveSignals(store *adaptive.SignalStore) {
-	for _, profile := range c.profiles {
-		if sp, ok := profile.(*SchedulerProfile); ok {
-			sp.WithAdaptiveSignals(store)
-		}
-	}
+// Profiles exposes the configured profiles by name. Used by external
+// wiring (e.g. the runner bootstrapping the adaptive subsystem) that
+// needs to enumerate concrete *SchedulerProfile instances to register
+// control-plane writers against.
+func (c *SchedulerConfig) Profiles() map[string]framework.SchedulerProfile {
+	return c.profiles
 }

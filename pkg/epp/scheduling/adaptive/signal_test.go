@@ -28,9 +28,9 @@ func TestSignalStore_RoundTrip(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			s := NewSignalStore()
 			if tc.state != (SignalState{}) {
-				s.Store(tc.state)
+				s.Put(tc.state)
 			}
-			require.Equal(t, tc.state, s.Load())
+			require.Equal(t, tc.state, s.Get())
 		})
 	}
 }
@@ -47,7 +47,7 @@ func TestSignalStore_ConcurrentReadersAndOneWriter(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < iterations; i++ {
-			s.Store(SignalState{Imbalance: float64(i) / float64(iterations)})
+			s.Put(SignalState{Imbalance: float64(i) / float64(iterations)})
 			select {
 			case <-stop:
 				return
@@ -61,7 +61,7 @@ func TestSignalStore_ConcurrentReadersAndOneWriter(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for range iterations {
-				got := s.Load()
+				got := s.Get()
 				require.GreaterOrEqual(t, got.Imbalance, 0.0)
 				require.LessOrEqual(t, got.Imbalance, 1.0)
 			}

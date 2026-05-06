@@ -8,8 +8,7 @@ import (
 
 const FeatureGate = "AdaptiveRouting"
 
-// Signal is one reading from a detector destined for the configurator
-// fan-in channel.
+// Signal is one detector reading bound for the configurator fan-in.
 type Signal struct {
 	Name      string
 	Value     float64
@@ -25,9 +24,8 @@ type SignalState struct {
 	UpdatedAt   time.Time
 }
 
-// SignalStore wraps an atomic.Pointer[SignalState] so the configurator
-// can publish a fresh state and the request hot path can read a
-// consistent snapshot without locks.
+// SignalStore wraps an atomic.Pointer[SignalState]. Lock-free read path
+// for any consumer that wants raw signal state (metrics, debug surfaces).
 type SignalStore struct {
 	ptr atomic.Pointer[SignalState]
 }
@@ -40,26 +38,24 @@ func NewSignalStore() *SignalStore {
 	return s
 }
 
-// Load returns a snapshot of the current state.
-func (s *SignalStore) Load() SignalState {
+// Get returns a snapshot of the current state.
+func (s *SignalStore) Get() SignalState {
 	if p := s.ptr.Load(); p != nil {
 		return *p
 	}
 	return SignalState{}
 }
 
-// Store replaces the current SignalState. The configurator is the only
-// goroutine that calls this in normal operation.
-func (s *SignalStore) Store(state SignalState) {
+// Put replaces the current SignalState. Configurator-only in normal use.
+func (s *SignalStore) Put(state SignalState) {
 	s.ptr.Store(&state)
 }
 
-// Detector is a goroutine that observes pool state and emits a smoothed
-// Signal in [0, 1] on each cycle. 
+// Detector observes pool state and emits a smoothed Signal in [0, 1] per cycle.
 type Detector interface {
 	// Name identifies the detector in metrics and logs.
 	Name() string
 
-	// Run blocks until ctx is done. 
+	// Run blocks until ctx is done.
 	Run(ctx context.Context, out chan<- Signal) error
 }

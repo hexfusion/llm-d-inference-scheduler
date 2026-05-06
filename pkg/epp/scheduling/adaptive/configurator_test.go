@@ -59,7 +59,7 @@ func TestConfigurator_HandleSignal(t *testing.T) {
 			for _, sig := range tc.signals {
 				c.handleSignal(sig)
 			}
-			got := store.Load()
+			got := store.Get()
 			require.Equal(t, tc.wantState.Imbalance, got.Imbalance)
 			require.Equal(t, tc.wantState.Burst, got.Burst)
 			require.Equal(t, tc.wantState.BurstActive, got.BurstActive)
@@ -77,7 +77,7 @@ func TestConfigurator_WatchdogFreezePublishesNeutralState(t *testing.T) {
 
 	// Pump imbalance so c.state.Imbalance is non-zero.
 	c.handleSignal(Signal{Name: "imbalance", Value: 0.5, Timestamp: clk.Now()})
-	require.Equal(t, 0.5, store.Load().Imbalance)
+	require.Equal(t, 0.5, store.Get().Imbalance)
 
 	// Rapid burst on/off flips to trip the watchdog.
 	for range watchdogMaxTransitions + 1 {
@@ -90,7 +90,7 @@ func TestConfigurator_WatchdogFreezePublishesNeutralState(t *testing.T) {
 	// After freeze: published state is neutral, internal state still tracks real values.
 	clk.Advance(time.Second)
 	c.handleSignal(Signal{Name: "imbalance", Value: 0.9, Timestamp: clk.Now()})
-	out := store.Load()
+	out := store.Get()
 	require.Zero(t, out.Imbalance, "neutral imbalance during freeze")
 	require.Zero(t, out.Burst, "neutral burst during freeze")
 	require.False(t, out.BurstActive, "neutral BurstActive during freeze")
@@ -99,7 +99,7 @@ func TestConfigurator_WatchdogFreezePublishesNeutralState(t *testing.T) {
 	// After freeze expires, real values resume.
 	clk.Advance(watchdogFreezeDuration + time.Second)
 	c.handleSignal(Signal{Name: "imbalance", Value: 0.3, Timestamp: clk.Now()})
-	require.NotZero(t, store.Load().Imbalance, "real values resume after unfreeze")
+	require.NotZero(t, store.Get().Imbalance, "real values resume after unfreeze")
 }
 
 func TestConfigurator_InitialPublishOnRun(t *testing.T) {
@@ -117,7 +117,7 @@ func TestConfigurator_InitialPublishOnRun(t *testing.T) {
 	}()
 
 	require.Eventually(t, func() bool {
-		return !store.Load().UpdatedAt.IsZero()
+		return !store.Get().UpdatedAt.IsZero()
 	}, 200*time.Millisecond, 5*time.Millisecond, "expected initial publish with non-zero UpdatedAt")
 
 	cancel()

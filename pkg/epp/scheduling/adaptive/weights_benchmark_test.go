@@ -62,13 +62,13 @@ func BenchmarkAdaptiveHotPath_TwoScorers(b *testing.B) {
 	// that's two of each per request.
 	recordWeightSetup(b)
 	store := NewSignalStore()
-	store.Store(SignalState{Imbalance: 0.7})
+	store.Put(SignalState{Imbalance: 0.7})
 	scorerA := fakeScorer{weight: 2.0, category: fwksched.Balance}
 	scorerB := fakeScorer{weight: 3.0, category: fwksched.Affinity}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		sigs := store.Load()
+		sigs := store.Get()
 		wA := EffectiveWeight(scorerA, sigs)
 		RecordWeight("queue-scorer", string(scorerA.Category()), wA)
 		wB := EffectiveWeight(scorerB, sigs)
@@ -78,13 +78,13 @@ func BenchmarkAdaptiveHotPath_TwoScorers(b *testing.B) {
 
 func BenchmarkAdaptiveHotPath_TwoScorers_NoRecord(b *testing.B) {
 	store := NewSignalStore()
-	store.Store(SignalState{Imbalance: 0.7})
+	store.Put(SignalState{Imbalance: 0.7})
 	scorerA := fakeScorer{weight: 2.0, category: fwksched.Balance}
 	scorerB := fakeScorer{weight: 3.0, category: fwksched.Affinity}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		sigs := store.Load()
+		sigs := store.Get()
 		_ = EffectiveWeight(scorerA, sigs)
 		_ = EffectiveWeight(scorerB, sigs)
 	}
