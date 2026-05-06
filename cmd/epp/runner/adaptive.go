@@ -9,6 +9,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/datastore"
+	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/framework/plugins/scheduling/picker"
+	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/framework/plugins/scheduling/picker/weightedrandom"
 	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/scheduling"
 	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/scheduling/adaptive"
 )
@@ -49,11 +51,14 @@ func bootstrapAdaptive(
 			logger.Info("skipping non-concrete profile", "name", name)
 			continue
 		}
+		// Default burst picker per the proposal: WeightedRandomPicker.
+		burstPicker := weightedrandom.NewWeightedRandomPicker(picker.DefaultMaxNumOfEndpoints).
+			WithName("adaptive-burst-picker")
 		binding := &adaptive.ProfileBinding{
 			UpdateConfig: sp.UpdateConfig,
 			Scorers:      sp.Scorers(),
 			Default:      sp.Picker(),
-			// Burst picker wiring deferred until config-loader plumbs it.
+			Burst:        burstPicker,
 		}
 		cfg.AddPublisher(binding.OnSignal)
 	}

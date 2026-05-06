@@ -20,12 +20,11 @@ const (
 )
 
 // LoadObservation is one tick of pool-level load metrics, one entry
-// per endpoint. ImbalanceDetector computes CV across these values.
+// per endpoint per metric. CV is scale-invariant, so raw counts are fine.
 type LoadObservation struct {
-	// Loads is one float per endpoint in [0, 1]. The detector
-	// computes spread; it doesn't care which metric (KV usage,
-	// queue depth, etc.) the deployment chose.
-	Loads []float64
+	KV      []float64 // KVCacheUsagePercent per pod
+	Waiting []float64 // WaitingQueueSize per pod
+	Running []float64 // RunningRequestsSize per pod
 }
 
 // LoadSampler is the seam between detectors and the data layer.
@@ -64,7 +63,10 @@ func (d *ImbalanceDetector) Run(ctx context.Context, out chan<- Signal) error {
 			if err != nil {
 				continue
 			}
-			cv := coefficientOfVariation(obs.Loads)
+			// Max CV across metrics: any one dimension diverging is a real signal.
+			cv := math.Max(coefficientOfVariation(obs.KV),
+				math.Max(coefficientOfVariation(obs.Waiting),
+					coefficientOfVariation(obs.Running)))
 			if math.IsNaN(cv) {
 				cv = 0
 			}
@@ -114,29 +116,31 @@ type PodLister interface {
 	PodList(predicate func(fwkdl.Endpoint) bool) []fwkdl.Endpoint
 }
 
-// DatastoreLoadSampler is the production LoadSampler: it walks the
-// EPP datastore on each Sample call and collects per-pod KV cache
-// utilization. KVCacheUsagePercent ships as a fraction in [0, 1] so
-// no scaling is needed before CV computation.
+// DatastoreLoadSampler walks the EPP datastore and collects KV, waiting,
+// and running per pod — the three signals the proposal calls out.
 type DatastoreLoadSampler struct {
 	ds PodLister
 }
 
-// NewDatastoreLoadSampler binds a sampler to the supplied pod source.
 func NewDatastoreLoadSampler(ds PodLister) *DatastoreLoadSampler {
 	return &DatastoreLoadSampler{ds: ds}
 }
 
-// Sample collects per-endpoint KV cache utilization. 
 func (s *DatastoreLoadSampler) Sample(_ context.Context) (LoadObservation, error) {
 	pods := s.ds.PodList(func(_ fwkdl.Endpoint) bool { return true })
-	loads := make([]float64, 0, len(pods))
+	obs := LoadObservation{
+		KV:      make([]float64, 0, len(pods)),
+		Waiting: make([]float64, 0, len(pods)),
+		Running: make([]float64, 0, len(pods)),
+	}
 	for _, pod := range pods {
 		m := pod.GetMetrics()
 		if m == nil {
 			continue
 		}
-		loads = append(loads, m.KVCacheUsagePercent)
+		obs.KV = append(obs.KV, m.KVCacheUsagePercent)
+		obs.Waiting = append(obs.Waiting, float64(m.WaitingQueueSize))
+		obs.Running = append(obs.Running, float64(m.RunningRequestsSize))
 	}
-	return LoadObservation{Loads: loads}, nil
+	return obs, nil
 }
