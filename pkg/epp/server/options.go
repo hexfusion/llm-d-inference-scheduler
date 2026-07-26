@@ -38,9 +38,10 @@ import (
 )
 
 const (
-	DefaultGrpcPort      = 9002
-	DefaultPoolNamespace = "default"        // default when pool namespace is empty (CLI flag default is empty)
-	DefaultDrainTimeout  = 30 * time.Second // graceful shutdown drain window
+	DefaultGrpcPort         = 9002
+	DefaultHTTPFrontendPort = 9004
+	DefaultPoolNamespace    = "default"        // default when pool namespace is empty (CLI flag default is empty)
+	DefaultDrainTimeout     = 30 * time.Second // graceful shutdown drain window
 )
 
 // deprecatedMetricFlags lists metric flags that are superseded by engineConfigs
@@ -58,6 +59,11 @@ func IsDeprecatedMetricFlag(name string) bool {
 	_, ok := deprecatedMetricFlags[name]
 	return ok
 }
+
+// defaultMaxRoutableBodyBytes is the max routable request body, shared by the
+// ext_proc recv limit, the decider's buffer pool, and the HTTP frontend, so they
+// cannot drift.
+const defaultMaxRoutableBodyBytes = 4 * 1024 * 1024
 
 // Options contains configuration values necessary to create and run the EPP.
 type Options struct {
@@ -83,6 +89,11 @@ type Options struct {
 	EndpointSelector            labels.Selector // Parsed selector to filter model server pods on. Set via --endpoint-selector flag and parsed in Complete().
 	EndpointTargetPorts         []int           // Target ports of model server pods.
 	DisableEndpointSubsetFilter bool            // Disables respecting destination endpoint subset metadata in EPP.
+	// EnableHTTPFrontend serves the same scheduling decision over an HTTP frontend
+	// on HTTPFrontendPort, in addition to the always-on ext_proc.
+	EnableHTTPFrontend bool
+	HTTPFrontendPort   int
+
 	//
 	// MSP metrics scraping.
 	//
@@ -141,6 +152,7 @@ func NewOptions() *Options {
 		Tracing:                          true,
 		MetricsPort:                      9090,
 		GRPCHealthPort:                   9003,
+		HTTPFrontendPort:                 DefaultHTTPFrontendPort,
 		EnablePprof:                      true,
 		SecureServing:                    true,
 		MetricsEndpointAuth:              true,
@@ -175,6 +187,10 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 		"Format: a comma-separated list of numbers without whitespace (e.g., '3000,3001,3002').")
 	fs.BoolVar(&opts.DisableEndpointSubsetFilter, "disable-endpoint-subset-filter", opts.DisableEndpointSubsetFilter,
 		"Disables respecting the destination endpoint subset metadata for dispatching requests in EPP.")
+	fs.BoolVar(&opts.EnableHTTPFrontend, "enable-http-frontend", opts.EnableHTTPFrontend,
+		"Serve routing decisions over an HTTP frontend in addition to ext_proc.")
+	fs.IntVar(&opts.HTTPFrontendPort, "http-frontend-port", opts.HTTPFrontendPort,
+		"Port for the HTTP frontend. Requires --enable-http-frontend.")
 	fs.DurationVar(&opts.RefreshMetricsInterval, "refresh-metrics-interval", opts.RefreshMetricsInterval, "Interval to refresh metrics.")
 	fs.DurationVar(&opts.RefreshPrometheusMetricsInterval, "refresh-prometheus-metrics-interval", opts.RefreshPrometheusMetricsInterval,
 		"Interval to flush Prometheus metrics.")
@@ -351,6 +367,13 @@ func (opts *Options) Validate() error {
 	}
 	if opts.MetricsCertDir != "" && opts.MetricsClientCAFile == "" && !opts.MetricsEndpointAuth {
 		return errMetricsTLSWithoutAuth
+	}
+
+	if f := opts.fs.Lookup("http-frontend-port"); f != nil && f.Changed && !opts.EnableHTTPFrontend {
+		return fmt.Errorf("flag %q requires %q", "http-frontend-port", "enable-http-frontend")
+	}
+	if opts.EnableHTTPFrontend && (opts.HTTPFrontendPort < 1 || opts.HTTPFrontendPort > 65535) {
+		return fmt.Errorf("invalid %q %d, must be 1 to 65535", "http-frontend-port", opts.HTTPFrontendPort)
 	}
 
 	if opts.GRPCMaxRecvMsgSize < 0 {

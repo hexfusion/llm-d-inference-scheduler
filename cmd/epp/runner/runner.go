@@ -39,6 +39,7 @@ import (
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	crlog "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -180,6 +181,7 @@ type Runner struct {
 	serverRunner     *runserver.ExtProcServerRunner
 	healthGRPCServer *grpc.Server
 	healthGRPCPort   int
+	frontends        []namedFrontend
 	draining         *atomic.Bool
 }
 
@@ -290,9 +292,12 @@ func (r *Runner) runWithGracefulShutdown(ctx context.Context, mgr ctrl.Manager, 
 	serveErr := make(chan error, 1)
 	go func() {
 		g := newRunnableGroup()
-		g.Add("ext-proc", func(c context.Context) error {
-			return r.serverRunner.AsRunnable(ctrl.Log.WithName("ext-proc")).Start(c)
-		})
+		ss := r.serverRunner.StreamingServer()
+		for _, nf := range r.frontends {
+			g.Add(nf.name, func(c context.Context) error {
+				return nf.f.Serve(crlog.IntoContext(c, ctrl.Log.WithName(nf.name)), ss)
+			})
+		}
 		g.Add("health", func(c context.Context) error {
 			return runnable.NoLeaderElection(runnable.GRPCServer("health", r.healthGRPCServer, r.healthGRPCPort)).Start(c)
 		})
@@ -500,6 +505,7 @@ func (r *Runner) setup(ctx context.Context, cfg *rest.Config, opts *runserver.Op
 	r.draining = &atomic.Bool{}
 	r.serverRunner = serverRunner
 	r.healthGRPCPort = opts.GRPCHealthPort
+	r.frontends = frontends(serverRunner, opts)
 	r.healthGRPCServer = newHealthGRPCServer(ctrl.Log.WithName("health"), ds, isLeader, r.draining, opts.EnableLeaderElection, supporters)
 	return mgr, ds, nil
 }
@@ -788,6 +794,22 @@ func (r *Runner) setupMetricsCollection(opts *runserver.Options) datalayer.Endpo
 	return r.dlRuntime
 }
 
+// namedFrontend pairs a frontend with its runnable-group key and log scope.
+type namedFrontend struct {
+	name string
+	f    runserver.Frontend
+}
+
+// frontends returns the frontends to run: ext_proc always, and HTTP when the
+// options set a port.
+func frontends(sr *runserver.ExtProcServerRunner, opts *runserver.Options) []namedFrontend {
+	fs := []namedFrontend{{"ext-proc", sr.GRPCFrontend()}}
+	if opts.EnableHTTPFrontend {
+		fs = append(fs, namedFrontend{"http", runserver.HTTPFrontend(opts.HTTPFrontendPort, int64(opts.GRPCMaxRecvMsgSize))})
+	}
+	return fs
+}
+
 // newHealthGRPCServer builds the gRPC health server. draining may be nil (graceful
 // drain disabled); when non-nil and set, non-liveness checks report NOT_SERVING.
 func newHealthGRPCServer(logger logr.Logger, ds datastore.Datastore, isLeader, draining *atomic.Bool, leaderElectionEnabled bool, supporters []appProtocolSupporter) *grpc.Server {
@@ -1042,17 +1064,20 @@ func (r *Runner) runWithFileDiscovery(ctx context.Context, opts *runserver.Optio
 	g.Add("discovery", func(ctx context.Context) error {
 		return disc.Start(ctx, fwkdl.NewDiscoveryNotifier(ds))
 	})
-	// epp-server and health wait for the discovery plugin's initial sync before
+	// Frontends and health wait for the discovery plugin's initial sync before
 	// going live, so requests and probes never observe an empty datastore. See
 	// EndpointDiscovery.Ready contract.
-	g.Add("epp-server", func(ctx context.Context) error {
-		select {
-		case <-disc.Ready():
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-		return serverRunner.AsRunnable(ctrl.Log.WithName("ext-proc")).Start(ctx)
-	})
+	ss := serverRunner.StreamingServer()
+	for _, nf := range frontends(serverRunner, opts) {
+		g.Add(nf.name, func(ctx context.Context) error {
+			select {
+			case <-disc.Ready():
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			return nf.f.Serve(crlog.IntoContext(ctx, ctrl.Log.WithName(nf.name)), ss)
+		})
+	}
 	g.Add("health", func(ctx context.Context) error {
 		select {
 		case <-disc.Ready():

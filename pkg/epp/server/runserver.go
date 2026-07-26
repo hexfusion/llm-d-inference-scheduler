@@ -18,38 +18,40 @@ package server
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
-	extProcPb "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	"github.com/go-logr/logr"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-	_ "google.golang.org/grpc/encoding/gzip" // Register gzip compressor for gRPC.
-	"google.golang.org/grpc/health"
-	healthgrpc "google.golang.org/grpc/health/grpc_health_v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	"github.com/llm-d/llm-d-router/internal/runnable"
-	tlsutil "github.com/llm-d/llm-d-router/internal/tls"
 	"github.com/llm-d/llm-d-router/pkg/common"
 	"github.com/llm-d/llm-d-router/pkg/epp/controller"
-	datalayerlogger "github.com/llm-d/llm-d-router/pkg/epp/datalayer/logger"
 	"github.com/llm-d/llm-d-router/pkg/epp/datastore"
 	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/contracts"
 	fwkfc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
 	"github.com/llm-d/llm-d-router/pkg/epp/handlers"
-	"github.com/llm-d/llm-d-router/pkg/epp/metrics"
 	"github.com/llm-d/llm-d-router/pkg/epp/requestcontrol"
 )
 
+// A Frontend serves routing decisions over a client protocol.
+type Frontend interface {
+	// Serve blocks until ctx ends or serving fails.
+	Serve(ctx context.Context, ss *handlers.StreamingServer) error
+}
+
 // ExtProcServerRunner provides methods to manage an external process server.
 type ExtProcServerRunner struct {
+	// streaming is the phase handler, built once and shared by every frontend.
+	streamingOnce sync.Once
+	streaming     *handlers.StreamingServer
+
 	GrpcPort int
 	// GrpcListener is an optional pre-bound listener for the ext_proc server.
 	// When set, GrpcPort is ignored. Reserving the port in advance of this
@@ -109,6 +111,46 @@ func NewDefaultExtProcServerRunner() *ExtProcServerRunner {
 	}
 }
 
+// StreamingServer builds the shared decider once. Every frontend receives the
+// same instance, so one buffer pool serves both and they cannot drift apart.
+func (r *ExtProcServerRunner) StreamingServer() *handlers.StreamingServer {
+	r.streamingOnce.Do(func() {
+		poolCap := r.GRPCMaxRecvMsgSize
+		if poolCap == 0 {
+			poolCap = defaultMaxRoutableBodyBytes
+		}
+		r.streaming = handlers.NewStreamingServer(r.Datastore, r.Director, r.ParserRegistry, poolCap)
+	})
+	return r.streaming
+}
+
+// GRPCFrontend builds the gRPC frontend from this runner's settings.
+func (r *ExtProcServerRunner) GRPCFrontend() Frontend {
+	return grpcFrontend{
+		Datastore:                        r.Datastore,
+		RefreshPrometheusMetricsInterval: r.RefreshPrometheusMetricsInterval,
+		MetricsStalenessThreshold:        r.MetricsStalenessThreshold,
+		SecureServing:                    r.SecureServing,
+		CertPath:                         r.CertPath,
+		EnableCertReload:                 r.EnableCertReload,
+		GRPCMaxRecvMsgSize:               r.GRPCMaxRecvMsgSize,
+		GRPCMaxSendMsgSize:               r.GRPCMaxSendMsgSize,
+		EnableGRPCStreamMetrics:          r.EnableGRPCStreamMetrics,
+		HealthChecking:                   r.HealthChecking,
+		GrpcPort:                         r.GrpcPort,
+		GrpcListener:                     r.GrpcListener,
+	}
+}
+
+// AsRunnable returns the gRPC frontend as a runnable, for existing callers.
+// cmd/epp/runner composes the frontend list.
+// The runnable implements LeaderElectionRunnable with leader election disabled.
+func (r *ExtProcServerRunner) AsRunnable(logger logr.Logger) manager.Runnable {
+	return runnable.NoLeaderElection(manager.RunnableFunc(func(ctx context.Context) error {
+		return r.GRPCFrontend().Serve(log.IntoContext(ctx, logger), r.StreamingServer())
+	}))
+}
+
 // SetupWithManager sets up the runner with the given manager.
 func (r *ExtProcServerRunner) SetupWithManager(mgr ctrl.Manager) error {
 	// Create the controllers and register them with the manager
@@ -155,87 +197,4 @@ func (r *ExtProcServerRunner) SetupWithManager(mgr ctrl.Manager) error {
 		return fmt.Errorf("failed setting up PodReconciler - %w", err)
 	}
 	return nil
-}
-
-// AsRunnable returns a Runnable that can be used to start the ext-proc gRPC server.
-// The runnable implements LeaderElectionRunnable with leader election disabled.
-func (r *ExtProcServerRunner) AsRunnable(logger logr.Logger) manager.Runnable {
-	return runnable.NoLeaderElection(manager.RunnableFunc(func(ctx context.Context) error {
-		datalayerlogger.StartMetricsLogger(ctx, r.Datastore, r.RefreshPrometheusMetricsInterval, r.MetricsStalenessThreshold)
-
-		var srv *grpc.Server
-		var creds credentials.TransportCredentials
-		if r.SecureServing {
-			var cert tls.Certificate
-			var err error
-			if r.CertPath != "" {
-				cert, err = tls.LoadX509KeyPair(r.CertPath+"/tls.crt", r.CertPath+"/tls.key")
-			} else {
-				// Create tls based credential.
-				cert, err = tlsutil.CreateSelfSignedTLSCertificate(logger)
-			}
-			if err != nil {
-				return fmt.Errorf("failed to create self signed certificate - %w", err)
-			}
-
-			if r.CertPath != "" && r.EnableCertReload {
-				reloader, err := common.NewCertReloader(ctx, r.CertPath, &cert)
-				if err != nil {
-					return fmt.Errorf("failed to create cert reloader: %w", err)
-				}
-				creds = credentials.NewTLS(&tls.Config{
-					GetCertificate: func(_ *tls.ClientHelloInfo) (*tls.Certificate, error) {
-						return reloader.Get(), nil
-					},
-					NextProtos: []string{"h2"},
-				})
-			} else {
-				creds = credentials.NewTLS(&tls.Config{
-					Certificates: []tls.Certificate{cert},
-					NextProtos:   []string{"h2"},
-				})
-			}
-		}
-
-		var grpcOpts []grpc.ServerOption
-		if creds != nil {
-			grpcOpts = append(grpcOpts, grpc.Creds(creds))
-		}
-		if r.GRPCMaxRecvMsgSize > 0 {
-			grpcOpts = append(grpcOpts, grpc.MaxRecvMsgSize(r.GRPCMaxRecvMsgSize))
-		}
-		if r.GRPCMaxSendMsgSize > 0 {
-			grpcOpts = append(grpcOpts, grpc.MaxSendMsgSize(r.GRPCMaxSendMsgSize))
-		}
-		if r.EnableGRPCStreamMetrics {
-			metrics.RegisterGRPCStreamMetrics()
-			grpcOpts = append(grpcOpts, grpc.ChainStreamInterceptor(streamMetricsInterceptor))
-		}
-		// Note: gzip compressor is registered via blank import above.
-
-		srv = grpc.NewServer(grpcOpts...)
-
-		poolCap := r.GRPCMaxRecvMsgSize
-		if poolCap == 0 {
-			poolCap = 4 * 1024 * 1024 // gRPC default 4MB
-		}
-		extProcServer := handlers.NewStreamingServer(r.Datastore, r.Director, r.ParserRegistry, poolCap)
-		extProcPb.RegisterExternalProcessorServer(srv, extProcServer)
-
-		if r.HealthChecking {
-			healthcheck := health.NewServer()
-			healthgrpc.RegisterHealthServer(srv,
-				healthcheck,
-			)
-			svcName := extProcPb.ExternalProcessor_ServiceDesc.ServiceName
-			logger.Info("Setting ExternalProcessor service status to SERVING", "serviceName", svcName)
-			healthcheck.SetServingStatus(svcName, healthgrpc.HealthCheckResponse_SERVING)
-		}
-
-		// Forward to the gRPC runnable.
-		if r.GrpcListener != nil {
-			return runnable.GRPCServerOnListener("ext-proc", srv, r.GrpcListener).Start(ctx)
-		}
-		return runnable.GRPCServer("ext-proc", srv, r.GrpcPort).Start(ctx)
-	}))
 }

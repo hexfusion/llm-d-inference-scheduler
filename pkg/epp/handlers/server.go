@@ -104,6 +104,11 @@ type StreamingServer struct {
 	maxPoolBufferSize int
 }
 
+// A stream implements bodyEchoDecliner when its caller discards the
+// request-body echo (the http.Flusher pattern). An ext_proc client needs that
+// echo to forward the request. An in-process caller already holds the bytes.
+type bodyEchoDecliner interface{ DeclinesRequestBodyEcho() bool }
+
 // RequestContext stores context information during the life time of an HTTP request.
 //
 // TODO(https://github.com/kubernetes-sigs/gateway-api-inference-extension/issues/2082):
@@ -146,8 +151,12 @@ type RequestContext struct {
 
 	Response *Response
 
-	reqHeaderResp  *extProcPb.ProcessingResponse
-	reqBodyResp    []*extProcPb.ProcessingResponse
+	reqHeaderResp *extProcPb.ProcessingResponse
+	reqBodyResp   []*extProcPb.ProcessingResponse
+	// skipBodyEcho distinguishes "caller declined the body echo" from "not built
+	// yet". Without it a nil reqBodyResp stalls the state machine, so
+	// IncRunningRequests never fires and running-requests reads zero.
+	skipBodyEcho   bool
 	reqTrailerResp *extProcPb.ProcessingResponse
 
 	respHeaderResp  *extProcPb.ProcessingResponse
@@ -480,7 +489,12 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 				}
 
 				reqCtx.reqHeaderResp = s.generateRequestHeaderResponse(ctx, reqCtx)
-				reqCtx.reqBodyResp = envoy.GenerateRequestBodyResponses(reqCtx.Request.RawBody)
+				if d, ok := srv.(bodyEchoDecliner); ok && d.DeclinesRequestBodyEcho() {
+					reqCtx.skipBodyEcho = true
+				}
+				if !reqCtx.skipBodyEcho {
+					reqCtx.reqBodyResp = envoy.GenerateRequestBodyResponses(reqCtx.Request.RawBody)
+				}
 				fairnessID, priority := extractFairnessAndPriority(reqCtx)
 				metrics.RecordRequestCounter(reqCtx.IncomingModelName, reqCtx.TargetModelName, fairnessID, reqCtx.Priority)
 				metrics.RecordRequestSizes(reqCtx.IncomingModelName, reqCtx.TargetModelName, fairnessID, priority, reqCtx.RequestSize)
@@ -688,8 +702,10 @@ func (r *RequestContext) updateStateAndSendIfNeeded(srv extProcPb.ExternalProces
 		}
 		r.RequestState = HeaderRequestResponseComplete
 	}
-	if r.RequestState == HeaderRequestResponseComplete && r.reqBodyResp != nil && len(r.reqBodyResp) > 0 {
-		loggerTrace.Info("Sending request body response(s)")
+	// The state must advance whether or not there are responses to send: a caller
+	// that declined the echo still transitions to running.
+	if r.RequestState == HeaderRequestResponseComplete && (r.skipBodyEcho || len(r.reqBodyResp) > 0) {
+		loggerTrace.Info("Sending request body response(s)", "count", len(r.reqBodyResp))
 
 		for _, response := range r.reqBodyResp {
 			if err := srv.Send(response); err != nil {
