@@ -102,6 +102,10 @@ type HarnessConfig struct {
 
 	// Tracing indicates if tracing should be enabled for this test.
 	Tracing bool
+
+	// httpFrontend starts the plain-HTTP frontend alongside ext_proc, so a test
+	// can drive the same StreamingServer over both transports.
+	httpFrontend bool
 }
 
 // HarnessOption is a functional option for configuring the TestHarness.
@@ -136,6 +140,14 @@ func WithTracing() HarnessOption {
 	}
 }
 
+// WithHTTPFrontend starts the plain-HTTP frontend so the harness exposes
+// HTTPBaseURL in addition to the ext_proc client.
+func WithHTTPFrontend() HarnessOption {
+	return func(c *HarnessConfig) {
+		c.httpFrontend = true
+	}
+}
+
 // metricsBackend abstracts how pod metrics are injected into the test environment.
 type metricsBackend interface {
 	SetPodMetrics(m map[types.NamespacedName]*fwkdl.Metrics)
@@ -153,7 +165,7 @@ func (b *mockDataSourceBackend) SetPodMetrics(m map[types.NamespacedName]*fwkdl.
 // TestHarness encapsulates the environment for a single isolated EPP test run.
 // It manages the lifecycle of the controller manager, the EPP server, and the K8s namespace.
 type TestHarness struct {
-	t         *testing.T
+	t         testing.TB
 	ctx       context.Context
 	Namespace string
 
@@ -164,6 +176,10 @@ type TestHarness struct {
 
 	Client    extProcPb.ExternalProcessor_ProcessClient
 	Datastore datastore.Datastore
+
+	// HTTPBaseURL is the plain-HTTP frontend's base URL, set only when the
+	// harness was built WithHTTPFrontend.
+	HTTPBaseURL string
 
 	// --- Tracing State ---
 	Exporter *tracetest.InMemoryExporter
@@ -184,7 +200,7 @@ func (h *TestHarness) hasCRDs() bool {
 // NewTestHarness boots up a fully isolated test environment.
 // It creates a unique Namespace, scopes the Manager to that Namespace, and starts the components.
 // Note: EPP tests must run serially because they rely on the global Prometheus registry.
-func NewTestHarness(ctx context.Context, t *testing.T, opts ...HarnessOption) *TestHarness {
+func NewTestHarness(ctx context.Context, t testing.TB, opts ...HarnessOption) *TestHarness {
 	t.Helper()
 
 	config := &HarnessConfig{}
@@ -224,6 +240,20 @@ func NewTestHarness(ctx context.Context, t *testing.T, opts ...HarnessOption) *T
 	grpcPort := lis.Addr().(*net.TCPAddr).Port
 
 	eppOptions := defaultEppServerOptions(t, testNamespaceName, configText)
+
+	// Reserve the HTTP port the same way as ext_proc: hand the pre-bound listener
+	// to the frontend so the port cannot be lost between selection and bind.
+	var httpListener net.Listener
+	var httpBaseURL string
+	if config.httpFrontend {
+		httpListener, err = testutils.ReserveListener()
+		require.NoError(t, err, "failed to reserve HTTP frontend port")
+		t.Cleanup(func() { _ = httpListener.Close() })
+		httpPort := httpListener.Addr().(*net.TCPAddr).Port
+		eppOptions.EnableHTTPFrontend = true
+		eppOptions.HTTPFrontendPort = httpPort
+		httpBaseURL = fmt.Sprintf("http://127.0.0.1:%d", httpPort)
+	}
 	if config.runMode == modeStandalone && config.standaloneStrategy == strategyNoCRD {
 		// Only standalone EPP without crd need to set the EndpointSelector.
 		eppOptions.EndpointSelector = labels.SelectorFromSet(labels.Set{"app": testPoolName})
@@ -237,7 +267,7 @@ func NewTestHarness(ctx context.Context, t *testing.T, opts ...HarnessOption) *T
 		Type: mockDataSourceType,
 		Name: mockDataSourceType,
 	})
-	runner, mgr, dataStore, err := eppRunner.NewTestRunnerSetup(ctx, testEnv.Config, eppOptions, mockDataSource, lis)
+	runner, mgr, dataStore, err := eppRunner.NewTestRunnerSetup(ctx, testEnv.Config, eppOptions, mockDataSource, lis, httpListener)
 	require.NoError(t, err, "failed to create manager")
 	backend := metricsBackend(&mockDataSourceBackend{mockDataSource: mockDataSource})
 
@@ -291,6 +321,7 @@ func NewTestHarness(ctx context.Context, t *testing.T, opts ...HarnessOption) *T
 		Tracing:            config.Tracing,
 		Client:             extProcClient,
 		Datastore:          dataStore,
+		HTTPBaseURL:        httpBaseURL,
 		Exporter:           exporter,
 		tp:                 tp,
 		grpcConn:           conn,
@@ -301,7 +332,7 @@ func NewTestHarness(ctx context.Context, t *testing.T, opts ...HarnessOption) *T
 	return h
 }
 
-func defaultEppServerOptions(t *testing.T, namespace, configText string) *eppServer.Options {
+func defaultEppServerOptions(t testing.TB, namespace, configText string) *eppServer.Options {
 	t.Helper()
 
 	eppOptions := eppServer.NewOptions()

@@ -23,6 +23,7 @@ import (
 
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
+	ctrlmgr "sigs.k8s.io/controller-runtime/pkg/manager"
 
 	"github.com/llm-d/llm-d-router/internal/runnable"
 	"github.com/llm-d/llm-d-router/pkg/epp/datastore"
@@ -35,8 +36,10 @@ import (
 // non-nil, its plugin type is registered as a factory that returns the provided instance, so the
 // YAML config can reference it by type name and the runner wires it into the endpoint factory
 // automatically. When grpcListener is non-nil the ext_proc server serves on it and
-// opts.GRPCPort is ignored.
-func NewTestRunnerSetup(ctx context.Context, cfg *rest.Config, opts *runserver.Options, mockDataSource fwkdl.DataSource, grpcListener net.Listener) (*Runner, ctrl.Manager, datastore.Datastore, error) {
+// opts.GRPCPort is ignored. When opts.EnableHTTPFrontend is set and httpListener
+// is non-nil, the HTTP frontend also serves, on httpListener, driving the same
+// StreamingServer as ext_proc.
+func NewTestRunnerSetup(ctx context.Context, cfg *rest.Config, opts *runserver.Options, mockDataSource fwkdl.DataSource, grpcListener, httpListener net.Listener) (*Runner, ctrl.Manager, datastore.Datastore, error) {
 	runner := NewRunner()
 
 	if mockDataSource != nil {
@@ -76,6 +79,20 @@ func NewTestRunnerSetup(ctx context.Context, cfg *rest.Config, opts *runserver.O
 	health := runnable.NoLeaderElection(runnable.GRPCServer("health", runner.healthGRPCServer, runner.healthGRPCPort))
 	if err := manager.Add(health); err != nil {
 		return runner, manager, ds, err
+	}
+
+	// Production composes frontends in cmd/epp/runner.frontends. The integration
+	// path adds the HTTP frontend here so both transports share one
+	// StreamingServer instance.
+	if opts.EnableHTTPFrontend && httpListener != nil {
+		ss := runner.serverRunner.StreamingServer()
+		httpFront := runserver.HTTPFrontend(0, int64(opts.GRPCMaxRecvMsgSize), runserver.WithListener(httpListener))
+		httpRunnable := runnable.NoLeaderElection(ctrlmgr.RunnableFunc(func(ctx context.Context) error {
+			return httpFront.Serve(ctx, ss)
+		}))
+		if err := manager.Add(httpRunnable); err != nil {
+			return runner, manager, ds, err
+		}
 	}
 
 	return runner, manager, ds, nil

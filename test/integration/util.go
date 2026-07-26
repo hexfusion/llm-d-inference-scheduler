@@ -590,7 +590,7 @@ func StartExtProcServer(
 // failure fails the test immediately instead of waiting out extprocConnSetupTimeout.
 func ExtProcServerClient(
 	ctx context.Context,
-	t *testing.T,
+	t testing.TB,
 	port int,
 	logger logr.Logger,
 	mgrErr <-chan error,
